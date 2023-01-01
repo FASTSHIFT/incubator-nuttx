@@ -350,6 +350,10 @@ config SIM_FRAMEBUFFER
 	---help---
 		Emulate a framebuffer
 
+config SIM_FRAMEBUFFER_DOUBLE_BUFFER
+	bool "Enable double framebuffer mode"
+	depends on SIM_FRAMEBUFFER
+
 config SIM_VNCSERVER
 	bool "VNC server"
 	depends on VNCSERVER

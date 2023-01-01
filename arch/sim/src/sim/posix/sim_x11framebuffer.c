@@ -54,6 +54,9 @@ static XShmSegmentInfo g_xshminfo;
 static int g_xerror;
 #endif
 static XImage *g_image;
+#ifdef CONFIG_SIM_FRAMEBUFFER_DOUBLE_BUFFER
+static XImage *g_image2;
+#endif
 static unsigned char *g_framebuffer;
 static unsigned short g_fbpixelwidth;
 static unsigned short g_fbpixelheight;
@@ -200,6 +203,9 @@ static void sim_x11uninit(void)
   if (g_shmcheckpoint > 1)
     {
       XDestroyImage(g_image);
+#ifdef CONFIG_SIM_FRAMEBUFFER_DOUBLE_BUFFER
+      XDestroyImage(g_image2);
+#endif
     }
 
   /* Un-grab the mouse buttons */
@@ -316,7 +322,11 @@ shmerror:
 #endif
       b_useshm = 0;
 
-      g_framebuffer = (unsigned char *)malloc(fblen);
+      size_t fb_mem_size = fblen;
+#ifdef CONFIG_SIM_FRAMEBUFFER_DOUBLE_BUFFER
+      fb_mem_size *= 2;
+#endif
+      g_framebuffer = (unsigned char *)malloc(fb_mem_size);
 
       g_image = XCreateImage(g_display, DefaultVisual(g_display, g_screen),
                              depth, ZPixmap, 0, (char *)g_framebuffer,
@@ -328,6 +338,20 @@ shmerror:
           syslog(LOG_ERR, "Unable to create g_image\n");
           return -1;
         }
+
+#ifdef CONFIG_SIM_FRAMEBUFFER_DOUBLE_BUFFER
+      g_image2 = XCreateImage(g_display, DefaultVisual(g_display, g_screen),
+                              depth, ZPixmap, 0, (char *)g_framebuffer + fblen,
+                              g_fbpixelwidth, g_fbpixelheight,
+                              8, 0);
+
+      if (g_image2 == NULL)
+        {
+          XDestroyImage(g_image);
+          syslog(LOG_ERR, "Unable to create g_image2\n");
+          return -1;
+        }
+#endif
 
       g_shmcheckpoint++;
     }
@@ -438,18 +462,24 @@ int sim_x11cmap(unsigned short first, unsigned short len,
  * Name: sim_x11update
  ****************************************************************************/
 
-void sim_x11update(void)
+void sim_x11update(int y_offset)
 {
+#ifdef CONFIG_SIM_FRAMEBUFFER_DOUBLE_BUFFER
+  XImage *image = y_offset ? g_image : g_image2;
+#else
+  XImage *image = g_image;
+#endif
+
 #ifndef CONFIG_SIM_X11NOSHM
   if (b_useshm)
     {
-      XShmPutImage(g_display, g_window, g_gc, g_image, 0, 0, 0, 0,
+      XShmPutImage(g_display, g_window, g_gc, image, 0, 0, 0, 0,
                    g_fbpixelwidth, g_fbpixelheight, 0);
     }
   else
 #endif
     {
-      XPutImage(g_display, g_window, g_gc, g_image, 0, 0, 0, 0,
+      XPutImage(g_display, g_window, g_gc, image, 0, 0, 0, 0,
                 g_fbpixelwidth, g_fbpixelheight);
     }
 

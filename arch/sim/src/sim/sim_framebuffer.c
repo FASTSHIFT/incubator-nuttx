@@ -95,6 +95,9 @@ static int sim_setcursor(struct fb_vtable_s *vtable,
                         struct fb_setcursor_s *settings);
 #endif
 
+static int sim_pandisplay(FAR struct fb_vtable_s *vtable,
+                          FAR struct fb_planeinfo_s *pinfo);
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
@@ -125,6 +128,10 @@ static const struct fb_planeinfo_s g_planeinfo =
   .stride   = FB_WIDTH,
   .display  = 0,
   .bpp      = CONFIG_SIM_FBBPP,
+#ifdef CONFIG_SIM_FRAMEBUFFER_DOUBLE_BUFFER
+  .xres_virtual = CONFIG_SIM_FBWIDTH,
+  .yres_virtual = CONFIG_SIM_FBHEIGHT * 2,
+#endif
 };
 #else
 /* This structure describes the single, X11 color plane */
@@ -144,6 +151,8 @@ static struct fb_cursorsize_s g_csize;
 #endif
 #endif
 
+static struct fb_planeinfo_s g_paninfo;
+
 /* The framebuffer object -- There is no private state information
  * in this simple framebuffer simulation.
  */
@@ -160,6 +169,7 @@ static struct fb_vtable_s g_fbobject =
   .getcursor     = sim_getcursor,
   .setcursor     = sim_setcursor,
 #endif
+  .pandisplay = sim_pandisplay
 };
 
 /****************************************************************************
@@ -333,8 +343,15 @@ static int sim_setcursor(struct fb_vtable_s *vtable,
 #endif
 
 /****************************************************************************
- * Public Functions
+ * Name: sim_pandisplay
  ****************************************************************************/
+
+static int sim_pandisplay(FAR struct fb_vtable_s *vtable,
+                          FAR struct fb_planeinfo_s *pinfo)
+{
+  memcpy(&g_paninfo, pinfo, sizeof(struct fb_planeinfo_s));
+  return OK;
+}
 
 /****************************************************************************
  * Name: sim_x11loop
@@ -350,7 +367,7 @@ void sim_x11loop(void)
 
       if (now - last >= MSEC2TICK(16))
         {
-          sim_x11update();
+          sim_x11update(g_paninfo.yoffset);
           fb_pollnotify(&g_fbobject);
           last = now;
         }
@@ -382,6 +399,10 @@ int up_fbinitialize(int display)
   ret = sim_x11initialize(CONFIG_SIM_FBWIDTH, CONFIG_SIM_FBHEIGHT,
                           &g_planeinfo.fbmem, &g_planeinfo.fblen,
                           &g_planeinfo.bpp, &g_planeinfo.stride);
+#ifdef CONFIG_SIM_FRAMEBUFFER_DOUBLE_BUFFER
+  g_planeinfo.xres_virtual = CONFIG_SIM_FBWIDTH;
+  g_planeinfo.yres_virtual = CONFIG_SIM_FBHEIGHT * 2;
+#endif
 #endif
 
   return ret;
