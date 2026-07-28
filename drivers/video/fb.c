@@ -164,6 +164,10 @@ static int     fb_get_panelinfo(FAR struct fb_chardev_s *fb,
 static int     fb_get_planeinfo(FAR struct fb_chardev_s *fb,
                                 FAR struct fb_planeinfo_s *pinfo,
                                 uint8_t display);
+#ifdef CONFIG_FB_OVERLAY
+static int     fb_get_overlayinfo(FAR struct fb_chardev_s *fb,
+                                  FAR struct fb_overlayinfo_s *oinfo);
+#endif
 #ifdef CONFIG_FB_SYNC
 static int     fb_sem_wait(FAR struct fb_chardev_s *fb,
                            FAR struct fb_priv_s *priv,
@@ -969,8 +973,7 @@ static int fb_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
               break;
             }
 
-          ret = fb->vtable->getoverlayinfo(fb->vtable,
-                                           oinfo->overlay, oinfo);
+          ret = fb_get_overlayinfo(fb, oinfo);
         }
         break;
 
@@ -1587,6 +1590,7 @@ static int fb_get_planeinfo(FAR struct fb_chardev_s *fb,
                             FAR struct fb_planeinfo_s *pinfo,
                             uint8_t display)
 {
+  union fb_paninfo_u info;
   int ret;
 
   DEBUGASSERT(fb->vtable != NULL);
@@ -1603,8 +1607,52 @@ static int fb_get_planeinfo(FAR struct fb_chardev_s *fb,
       return ret;
     }
 
+  /* The head of the pan queue is the frame being scanned out. The lower
+   * half does not track it, so report its yoffset.
+   */
+
+  if (fb_peek_paninfo(fb->vtable, &info, FB_NO_OVERLAY) == OK)
+    {
+      pinfo->yoffset = info.planeinfo.yoffset;
+    }
+
   return OK;
 }
+
+#ifdef CONFIG_FB_OVERLAY
+/****************************************************************************
+ * Name: fb_get_overlayinfo
+ ****************************************************************************/
+
+static int fb_get_overlayinfo(FAR struct fb_chardev_s *fb,
+                              FAR struct fb_overlayinfo_s *oinfo)
+{
+  union fb_paninfo_u info;
+  int ret;
+
+  DEBUGASSERT(fb->vtable != NULL);
+  DEBUGASSERT(fb->vtable->getoverlayinfo != NULL);
+
+  ret = fb->vtable->getoverlayinfo(fb->vtable, oinfo->overlay, oinfo);
+  if (ret < 0)
+    {
+      gerr("ERROR: getoverlayinfo() failed: %d\n", ret);
+      return ret;
+    }
+
+  /* Same as fb_get_planeinfo(): report the yoffset of the frame being
+   * scanned out.
+   */
+
+  if (oinfo->overlay + 1 < fb->paninfo_count &&
+      fb_peek_paninfo(fb->vtable, &info, oinfo->overlay) == OK)
+    {
+      oinfo->yoffset = info.overlayinfo.yoffset;
+    }
+
+  return OK;
+}
+#endif
 
 /****************************************************************************
  * Name: fb_do_pollnotify
