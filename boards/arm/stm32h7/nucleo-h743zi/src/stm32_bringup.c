@@ -255,6 +255,14 @@ int stm32_bringup(void)
 
   UNUSED(ret);
 
+#ifdef CONFIG_NUCLEO_H743ZI_NXTRACE
+  /* Bring up the zero-intrusion parallel ETM + DWT thread-switch trace path
+   * as early as possible so switches are captured from the very first tasks.
+   */
+
+  stm32_nxtrace_setup();
+#endif
+
 #if defined(CONFIG_I2C) && defined(CONFIG_SYSTEM_I2CTOOL)
   stm32_i2ctool();
 #endif

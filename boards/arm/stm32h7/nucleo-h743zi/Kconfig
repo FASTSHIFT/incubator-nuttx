@@ -27,4 +27,31 @@ config STM32_ROMFS_IMAGEFILE
 	depends on STM32_ROMFS
 	default "../../../rom.img"
 
+config NUCLEO_H743ZI_NXTRACE
+	bool "Zero-intrusion parallel ETM + DWT thread-switch trace"
+	default n
+	---help---
+		Program the CoreSight trace path (GPIOE PE2..PE6 = TRACECK/TRACED0..3,
+		DBGMCU, TPIU, funnel, ETF, ETM, DWT/ITM) at board bring-up for capture
+		by an external Artix-7 FPGA over the 4-bit parallel trace port.
+
+		Two streams share the parallel TPIU: ETM instruction trace (ATB ID 2)
+		and DWT data-value packets (ATB ID 1) emitted on every write to
+		g_running_tasks -- i.e. every thread switch, with the new TCB pointer
+		carried in the packet payload. This is fully non-intrusive: it touches
+		only debug/trace registers and never modifies the kernel, scheduler or
+		TCB. Host-side decode is done by cortrace (see cortrace-fpga docs).
+
+config NUCLEO_H743ZI_NXTRACE_HEARTBEAT
+	bool "nxtrace heartbeat thread (standalone switch generator)"
+	default y
+	depends on NUCLEO_H743ZI_NXTRACE
+	---help---
+		Start a tiny always-on kernel thread that sleeps in a loop, guaranteeing
+		a steady stream of context switches (idle <-> heartbeat) with NO debugger
+		attached. This lets the FPGA capture the DWT thread-switch stream
+		standalone -- necessary because attaching a debugger for RTT would clear
+		the DWT comparator. The real demo workload (hellotrace churn workers)
+		rides on top of this.
+
 endif # ARCH_BOARD_NUCLEO_H743ZI

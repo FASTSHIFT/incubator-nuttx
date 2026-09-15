@@ -243,6 +243,22 @@
 int stm32_bringup(void);
 
 /****************************************************************************
+ * Name: stm32_nxtrace_setup
+ *
+ * Description:
+ *   Program the CoreSight parallel ETM + DWT thread-switch trace path for
+ *   capture by an external FPGA. Zero-intrusion (debug registers only).
+ *
+ ****************************************************************************/
+
+#ifdef CONFIG_NUCLEO_H743ZI_NXTRACE
+void stm32_nxtrace_setup(void);
+#  ifdef CONFIG_NUCLEO_H743ZI_NXTRACE_HEARTBEAT
+void stm32_nxtrace_heartbeat_start(void);
+#  endif
+#endif
+
+/****************************************************************************
  * Name: stm32_spidev_initialize
  *
  * Description:

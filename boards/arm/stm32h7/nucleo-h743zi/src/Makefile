@@ -110,4 +110,12 @@ ifeq ($(CONFIG_MMCSD),y)
 CSRCS += stm32_mmcsd.c
 endif
 
+ifeq ($(CONFIG_NUCLEO_H743ZI_NXTRACE),y)
+CSRCS += stm32_nxtrace.c
+endif
+
+ifeq ($(CONFIG_ARCH_IDLE_CUSTOM),y)
+CSRCS += stm32_idle.c
+endif
+
 include $(TOPDIR)/boards/Board.mk
