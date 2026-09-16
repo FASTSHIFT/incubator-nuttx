@@ -21,30 +21,20 @@
  ****************************************************************************/
 
 /****************************************************************************
- * ZERO-INTRUSION THREAD-SWITCH TRACE OVER THE PARALLEL TRACE PORT
+ * ZERO-INTRUSION THREAD-SWITCH TRACE -- NuttX side is now JUST A DEMO WORKLOAD
  *
- * This brings up the STM32H743 CoreSight parallel-trace path (ETM instruction
- * stream + DWT data-value packets) so an external FPGA (A7-Lite) can capture
- * both on the 4-bit TRACED[3:0] port and cortrace can demux them:
+ * The whole CoreSight parallel-trace path (GPIOE TRACED pins, TPIU, CSTF, ETF,
+ * ETM, TSGEN) AND the DWT comparator that watches g_running_tasks are now
+ * configured entirely by the debugger (DAP) from the host -- see
+ * cortrace-fpga/host/scripts/nxtrace_dap.cfg. That works because NuttX's
+ * arm_enable_dbgmonitor() skips its DWT-clearing init while a debugger is
+ * attached (DHCSR.C_DEBUGEN=1), so as long as the DAP stays connected the DWT
+ * config survives. This is the TRACE32/J-Trace "probe always attached" model.
  *
- *   ETM  --ATB--> CSTF S0 --\
- *                            +--> ETF --> TPIU --> TRACECK/TRACED[3:0]
- *   DWT/ITM --ATB-> CSTF S1 -/
- *
- * A DWT comparator watches WRITES to g_running_tasks; the hardware emits the
- * *written value* (the new TCB pointer) as a data-value packet at the instant
- * of the context switch -- so no scheduler code is touched and short-lived
- * threads are never missed (doc 01 §3/§4/§11.8).
- *
- * IMPORTANT: this is pure board-level bring-up -- GPIO mux + CoreSight trace
- * register programming. It does NOT modify the scheduler, the TCB layout, or
- * any RTOS data structure. The DWT comparator is a passive watchpoint in
- * data-value mode (FUNCTION=0x0D), NOT a debug watchpoint, so it never halts
- * the CPU. Zero RTOS impact.
- *
- * Register map / bit values are the on-board-validated sequence from the
- * bare-metal firmware (stm32h743-etm-trace-firmware, etm_selftrace.c) and
- * RM0433 §60 / DDI0494D. See cortrace-fpga/docs/01-nuttx-thread-profiling.md.
+ * => NuttX needs NO trace/register bring-up code. This file only spawns two
+ * demo worker threads with distinct call graphs so there is something to see
+ * (thread switches + per-thread call stacks) in the captured trace. For a real
+ * application these are unnecessary; the trace is fully non-intrusive.
  ****************************************************************************/
 
 /****************************************************************************
@@ -53,182 +43,26 @@
 
 #include <nuttx/config.h>
 
-#include <stdint.h>
-#include <syslog.h>
-#include <unistd.h>
-#include <sched.h>
 #include <fcntl.h>
+#include <sched.h>
+#include <stdint.h>
+#include <unistd.h>
 
 #include <nuttx/kthread.h>
-
-#include "arm_internal.h"          /* getreg32 / putreg32 / modifyreg32 */
-#include "stm32_gpio.h"            /* stm32_configgpio + GPIO_* macros */
 
 #ifdef CONFIG_NUCLEO_H743ZI_NXTRACE
 
 /****************************************************************************
- * Pre-processor Definitions
+ * Private Data
  ****************************************************************************/
 
-/* The kernel symbol whose writes mark a context switch is g_running_tasks[]
- * (declared in <nuttx/sched.h>, included via arm_internal.h -> nuttx/arch.h):
- * g_running_tasks[cpu] is written with the new TCB pointer on every switch, so
- * watching its address yields the new TCB pointer in the DWT stream. */
-
-#include <nuttx/sched.h>
-
-/* CoreSight software-lock magic (write to a component's LAR at +0xFB0). */
-
-#define CS_LAR_UNLOCK 0xc5acce55u
-
-/* --- GPIOE PE2..PE6 = TRACECK / TRACED0..3, AF0, very-high speed --------- */
-
-#define GPIO_TRACECK  (GPIO_ALT | GPIO_AF0 | GPIO_PUSHPULL | \
-                       GPIO_SPEED_100MHz | GPIO_PORTE | GPIO_PIN2)
-#define GPIO_TRACED0  (GPIO_ALT | GPIO_AF0 | GPIO_PUSHPULL | \
-                       GPIO_SPEED_100MHz | GPIO_PORTE | GPIO_PIN3)
-#define GPIO_TRACED1  (GPIO_ALT | GPIO_AF0 | GPIO_PUSHPULL | \
-                       GPIO_SPEED_100MHz | GPIO_PORTE | GPIO_PIN4)
-#define GPIO_TRACED2  (GPIO_ALT | GPIO_AF0 | GPIO_PUSHPULL | \
-                       GPIO_SPEED_100MHz | GPIO_PORTE | GPIO_PIN5)
-#define GPIO_TRACED3  (GPIO_ALT | GPIO_AF0 | GPIO_PUSHPULL | \
-                       GPIO_SPEED_100MHz | GPIO_PORTE | GPIO_PIN6)
-
-/* --- DBGMCU trace clock gate (H7 D-domain APB-D alias) ------------------- */
-
-#define DBGMCU_CR        0x5c001004u
-#define DBGMCU_CR_TRACE_ALL ((1u << 20) | (1u << 21) | (1u << 22))
-
-/* --- core PPB: DEMCR global trace enable -------------------------------- */
-
-#define DEMCR            0xe000edfcu
-#define DEMCR_TRCENA       (1u << 24)
-
-/* --- SoC TPIU (APB-D alias 0x5C015000) ---------------------------------- */
-
-#define TPIU_BASE        0x5c015000u
-#define TPIU_CURPSIZE    (TPIU_BASE + 0x004u)
-#define TPIU_SPPR        (TPIU_BASE + 0x0f0u)
-#define TPIU_FFCR        (TPIU_BASE + 0x304u)
-#define TPIU_LAR         (TPIU_BASE + 0xfb0u)
-#define TPIU_CURPSIZE_4BIT 0x00000008u
-#define TPIU_SPPR_PARALLEL 0x00000000u
-#define TPIU_FFCR_CONT     0x00000102u
-
-/* --- CoreSight trace funnel (CSTF, 0x5C013000): S0=ETM, S1=ITM/DWT ------- */
-
-#define CSTF_BASE        0x5c013000u
-#define CSTF_CTRL        (CSTF_BASE + 0x000u)
-#define CSTF_PRIORITY    (CSTF_BASE + 0x004u)
-#define CSTF_LAR         (CSTF_BASE + 0xfb0u)
-#define CSTF_CTRL_ENS0     (1u << 0)
-#define CSTF_CTRL_ENS1     (1u << 1)
-#define CSTF_PRIPORT0_MASK 0x00000007u
-#define CSTF_PRIPORT1_MASK 0x00000038u
-
-/* --- Embedded trace FIFO (ETF/TMC, 0x5C014000) -------------------------- */
-
-#define ETF_BASE         0x5c014000u
-#define ETF_CTL          (ETF_BASE + 0x020u)
-#define ETF_MODE         (ETF_BASE + 0x028u)
-#define ETF_FFCR         (ETF_BASE + 0x304u)
-#define ETF_LAR          (ETF_BASE + 0xfb0u)
-#define ETF_CTL_TRACECAPTEN 0x00000001u
-#define ETF_MODE_HW_FIFO    0x00000002u
-#define ETF_FFCR_ENFT       0x00000001u
-
-/* --- ETM-M7 (ETMv4, core-local 0xE0041000) ------------------------------ */
-
-#define ETM_BASE         0xe0041000u
-#define ETM_TRCPRGCTLR   (ETM_BASE + 0x004u)
-#define ETM_TRCSTATR     (ETM_BASE + 0x00cu)
-#define ETM_TRCCONFIGR   (ETM_BASE + 0x010u)
-#define ETM_TRCSTALLCTLR (ETM_BASE + 0x02cu)
-#define ETM_TRCTSCTLR    (ETM_BASE + 0x030u)
-#define ETM_TRCSYNCPR    (ETM_BASE + 0x034u)
-#define ETM_TRCCCCTLR    (ETM_BASE + 0x038u)
-#define ETM_TRCTRACEIDR  (ETM_BASE + 0x040u)
-#define ETM_TRCVICTLR    (ETM_BASE + 0x080u)
-#define ETM_TRCPDCR      (ETM_BASE + 0x310u)
-#define ETM_LAR          (ETM_BASE + 0xfb0u)
-#define ETM_TRCPRGCTLR_EN   (1u << 0)
-#define ETM_TRCSTATR_IDLE   (1u << 0)
-#define ETM_TRCCONFIGR_BB   (1u << 3)
-#define ETM_TRCCONFIGR_CCI  (1u << 4)   /* cycle counting instruction */
-#define ETM_TRCCONFIGR_TS   (1u << 11)  /* global timestamping */
-#define ETM_TRCCCCTLR_THRESHOLD 0x00000010u   /* 16 cycles (>= TRCIDR3.CCITMIN) */
-#define ETM_TRCSTALLCTLR_ISTALL (1u << 8)
-#define ETM_TRCVICTLR_TRACE_ALL 0x00000201u
-#define ETM_TRCTRACEIDR_ID2     0x00000002u
-#define ETM_TRCSYNCPR_4K        0x0000000cu
-#define ETM_TRCPDCR_PU          (1u << 3)
-
-/* --- CoreSight timestamp generator (TSGEN, APB-D alias 0x5C005000) -------- */
-/* The SoC-wide counter the ETM samples into TIMESTAMP packets. Resets DISABLED
- * (CNTCR=0), so every ETM timestamp reads 0 until CNTCR.EN is set. */
-
-#define TSGEN_CNTCR      0x5c005000u
-#define TSGEN_CNTCR_EN     (1u << 0)
-
-/* --- DWT + ITM (core PPB) ------------------------------------------------ */
-
-#define DWT_BASE         0xe0001000u
-#define DWT_CTRL_REG     (DWT_BASE + 0x000u)
-#define DWT_COMP0        (DWT_BASE + 0x020u)
-#define DWT_MASK0        (DWT_BASE + 0x024u)
-#define DWT_FUNCTION0    (DWT_BASE + 0x028u)
-#define DWT_CYCCNT_REG   (DWT_BASE + 0x004u)
-#define DWT_CTRL_CYCCNTENA 0x40000001u
-#define DWT_FUNCTION_DATAVWRITE 0x0000000du   /* data-value packet on write */
-
-#define ITM_BASE         0xe0000000u
-#define ITM_TER          (ITM_BASE + 0xe00u)
-#define ITM_TPR          (ITM_BASE + 0xe40u)
-#define ITM_TCR          (ITM_BASE + 0xe80u)
-#define ITM_LAR          (ITM_BASE + 0xfb0u)
-/* ITMENA|TSENA|SYNCENA|TXENA, TraceBusID = 1 (host demux: ETM=2, DWT/ITM=1). */
-#define ITM_TCR_DWT_ATB    0x0001000fu
+static volatile uint32_t g_compute_sink;
 
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
 
-static void nxtrace_gpio(void)
-{
-  stm32_configgpio(GPIO_TRACECK);
-  stm32_configgpio(GPIO_TRACED0);
-  stm32_configgpio(GPIO_TRACED1);
-  stm32_configgpio(GPIO_TRACED2);
-  stm32_configgpio(GPIO_TRACED3);
-}
-
-/* Two demo worker threads with DELIBERATELY DIFFERENT call graphs so each
- * thread's re-attributed ETM call stack looks distinct in Perfetto (the whole
- * point: "which thread is doing what"):
- *   - worker_compute : CPU-bound integer/float math through a small call tree
- *   - worker_fileio  : open/write/read/close a tmpfs file in a loop
- * Both periodically sched_yield so the scheduler rotates them (+ idle),
- * feeding the DWT a steady g_running_tasks stream. Pure demo workload. */
-
-static volatile uint32_t g_compute_sink;
-
-/* Keep the DWT comparator armed: if anything (debug-monitor init, a debugger
- * connect) cleared it after boot, restore it within one loop iteration so the
- * switch stream never dries up. Cheap (a few register reads/writes). */
-
-static void nxtrace_dwt_rearm(void)
-{
-  if (getreg32(DWT_FUNCTION0) != DWT_FUNCTION_DATAVWRITE ||
-      getreg32(DWT_COMP0) != (uint32_t)(uintptr_t)&g_running_tasks[0])
-    {
-      putreg32(0, DWT_FUNCTION0);
-      putreg32((uint32_t)(uintptr_t)&g_running_tasks[0], DWT_COMP0);
-      putreg32(0, DWT_MASK0);
-      putreg32(DWT_FUNCTION_DATAVWRITE, DWT_FUNCTION0);
-    }
-}
-
-/* ---- compute worker: a small call tree of arithmetic ------------------- */
+/* compute worker: a small arithmetic call tree (compute_step -> compute_mix). */
 
 static uint32_t compute_mix(uint32_t x)
 {
@@ -248,8 +82,6 @@ static int worker_compute(int argc, char *argv[])
 
   for (; ; )
     {
-      nxtrace_dwt_rearm();
-
       for (uint32_t i = 0; i < 400; i++)
         {
           acc = compute_step(acc, i);
@@ -262,7 +94,7 @@ static int worker_compute(int argc, char *argv[])
   return 0;
 }
 
-/* ---- fileio worker: write then read back a tmpfs file ------------------ */
+/* fileio worker: write then read back a tmpfs file (pulls in the VFS path). */
 
 static int worker_fileio(int argc, char *argv[])
 {
@@ -271,8 +103,6 @@ static int worker_fileio(int argc, char *argv[])
 
   for (; ; )
     {
-      nxtrace_dwt_rearm();
-
       int fd = open("/tmp/nxio.dat", O_WRONLY | O_CREAT | O_TRUNC, 0666);
       if (fd >= 0)
         {
@@ -298,16 +128,6 @@ static int worker_fileio(int argc, char *argv[])
   return 0;
 }
 
-static void nxtrace_spawn_workers(void)
-{
-  /* Equal priority so SCHED_RR / sched_yield round-robins between them. Two
-   * distinct call graphs -> two visibly different per-thread callstack lanes.
-   * fileio needs a larger stack (VFS + tmpfs paths). */
-
-  kthread_create("compute", 100, 1536, worker_compute, NULL);
-  kthread_create("fileio", 100, 2048, worker_fileio, NULL);
-}
-
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -316,120 +136,31 @@ static void nxtrace_spawn_workers(void)
  * Name: stm32_nxtrace_setup
  *
  * Description:
- *   Bring up the parallel trace path (ETM + DWT/ITM -> CSTF -> ETF -> TPIU ->
- *   TRACED[3:0]) and arm a DWT comparator on g_running_tasks so context
- *   switches emit the new TCB pointer as a data-value packet. Pure board-level
- *   CoreSight programming; the scheduler is untouched.
+ *   No-op: the trace path + DWT are configured by the debugger (see
+ *   nxtrace_dap.cfg). Kept as a stable board hook so stm32_bringup.c does not
+ *   need conditional edits.
  *
  ****************************************************************************/
 
 void stm32_nxtrace_setup(void)
 {
-  volatile int i;
-
-  /* 1) trace pins + clock domain + global trace enable. */
-
-  nxtrace_gpio();
-  modifyreg32(DBGMCU_CR, 0, DBGMCU_CR_TRACE_ALL);
-  putreg32(DEMCR_TRCENA, DEMCR);
-
-  /* Enable the SoC timestamp generator so ETM TIMESTAMP packets carry a real
-   * count (it resets disabled -> every timestamp would otherwise read 0). */
-
-  modifyreg32(TSGEN_CNTCR, 0, TSGEN_CNTCR_EN);
-
-  /* 2) TPIU: 4-bit parallel, continuous formatter. */
-
-  putreg32(CS_LAR_UNLOCK, TPIU_LAR);
-  putreg32(TPIU_CURPSIZE_4BIT, TPIU_CURPSIZE);
-  putreg32(TPIU_SPPR_PARALLEL, TPIU_SPPR);
-  putreg32(TPIU_FFCR_CONT, TPIU_FFCR);
-
-  /* 3) CSTF: S0=ETM + S1=ITM/DWT, ITM priority above ETM (RMW, keep reserved).
-   */
-
-  putreg32(CS_LAR_UNLOCK, CSTF_LAR);
-  modifyreg32(CSTF_CTRL, 0, CSTF_CTRL_ENS0 | CSTF_CTRL_ENS1);
-  modifyreg32(CSTF_PRIORITY, CSTF_PRIPORT0_MASK | CSTF_PRIPORT1_MASK,
-              (1u << 0) /* PRIPORT0 ETM = 1 */ | (0u << 3) /* PRIPORT1 ITM = 0 */);
-
-  /* 4) ETF: hardware-FIFO mode -> TPIU. */
-
-  putreg32(0, ETF_CTL);
-  putreg32(CS_LAR_UNLOCK, ETF_LAR);
-  putreg32(ETF_MODE_HW_FIFO, ETF_MODE);
-  putreg32(ETF_FFCR_ENFT, ETF_FFCR);
-  putreg32(ETF_CTL_TRACECAPTEN, ETF_CTL);
-
-  /* 5) ETM: BB + STALL(ISTALL) + trace-all, ATB ID 2, 4K sync. */
-
-  putreg32(CS_LAR_UNLOCK, ETM_LAR);
-  putreg32(ETM_TRCPDCR_PU, ETM_TRCPDCR);
-  putreg32(0, ETM_TRCPRGCTLR);
-  for (i = 0; i < 1000; i++)
-    {
-      if (getreg32(ETM_TRCSTATR) & ETM_TRCSTATR_IDLE)
-        {
-          break;
-        }
-    }
-
-  /* Global timestamping (TS) + cycle counting (CCI), NO branch broadcast (BB).
-   * BB emits an address on every taken branch -> high byte-rate that overruns
-   * the parallel port when combined with TS/CC; without BB only indirect
-   * branches emit addresses and the decoder walks the ELF for direct branches,
-   * so the stream fits. TS gives sparse execution-time anchors from the TSGEN;
-   * CCI emits exact CPU-cycle counts so the host interpolates between anchors at
-   * cycle resolution -- the real execution-time base (NOT the FPGA ETF-egress
-   * time, which lags through the FIFO). Keep stall as ISTALL only (LEVEL=0): a
-   * nonzero stall LEVEL suppresses in-stream timestamps (DDI0494D §3.4.7). */
-
-  putreg32(ETM_TRCCONFIGR_TS | ETM_TRCCONFIGR_CCI, ETM_TRCCONFIGR);
-  putreg32(ETM_TRCTRACEIDR_ID2, ETM_TRCTRACEIDR);
-  putreg32(ETM_TRCCCCTLR_THRESHOLD, ETM_TRCCCCTLR);
-  putreg32(ETM_TRCSTALLCTLR_ISTALL, ETM_TRCSTALLCTLR);
-  putreg32(ETM_TRCVICTLR_TRACE_ALL, ETM_TRCVICTLR);
-  putreg32(ETM_TRCSYNCPR_4K, ETM_TRCSYNCPR);
-  putreg32(0, ETM_TRCTSCTLR);
-  putreg32(ETM_TRCPRGCTLR_EN, ETM_TRCPRGCTLR);
-
-  /* 6) DWT data-value trace: watch WRITES to g_running_tasks; ITM forwards the
-   * data-value packets onto ATB ID 1. Passive watchpoint (FUNCTION=0x0D), never
-   * halts the CPU.
-   */
-
-  putreg32(CS_LAR_UNLOCK, ITM_LAR);
-  putreg32(0, ITM_TPR);
-  putreg32(0xffffffffu, ITM_TER);
-  putreg32(ITM_TCR_DWT_ATB, ITM_TCR);
-
-  putreg32(0, DWT_CYCCNT_REG);
-  putreg32(DWT_CTRL_CYCCNTENA, DWT_CTRL_REG);
-  putreg32(0, DWT_FUNCTION0);                     /* disable while programming */
-  putreg32((uint32_t)(uintptr_t)&g_running_tasks[0], DWT_COMP0);
-  putreg32(0, DWT_MASK0);                          /* exact address match */
-  putreg32(DWT_FUNCTION_DATAVWRITE, DWT_FUNCTION0);
-
-  syslog(LOG_INFO,
-         "nxtrace: parallel ETM+DWT up; DWT watch g_running_tasks@%p "
-         "(FUNC0=0x%08lx)\n",
-         (void *)&g_running_tasks[0],
-         (unsigned long)getreg32(DWT_FUNCTION0));
-
 }
 
 /****************************************************************************
  * Name: stm32_nxtrace_workers_start
  *
  * Description:
- *   Spawn the two demo worker threads (compute + tmpfs file I/O). Call AFTER
- *   the tmpfs mount so the fileio worker has /tmp available.
+ *   Spawn the two demo worker threads (compute + tmpfs file I/O) so the trace
+ *   has thread switches + distinct per-thread call stacks to show. Call AFTER
+ *   the tmpfs mount (the fileio worker needs /tmp). Equal priority so
+ *   sched_yield round-robins them.
  *
  ****************************************************************************/
 
 void stm32_nxtrace_workers_start(void)
 {
-  nxtrace_spawn_workers();
+  kthread_create("compute", 100, 1536, worker_compute, NULL);
+  kthread_create("fileio", 100, 2048, worker_fileio, NULL);
 }
 
 #endif /* CONFIG_NUCLEO_H743ZI_NXTRACE */
