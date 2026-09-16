@@ -289,6 +289,15 @@ int stm32_bringup(void)
     }
 #endif
 
+#ifdef CONFIG_NUCLEO_H743ZI_NXTRACE
+  /* Start the demo worker threads now that tmpfs is mounted (the fileio worker
+   * needs /tmp). The trace path + DWT were already armed in stm32_nxtrace_setup
+   * at the top of bring-up.
+   */
+
+  stm32_nxtrace_workers_start();
+#endif
+
 #ifdef CONFIG_STM32_ROMFS
   /* Mount the romfs partition */
 

@@ -253,9 +253,7 @@ int stm32_bringup(void);
 
 #ifdef CONFIG_NUCLEO_H743ZI_NXTRACE
 void stm32_nxtrace_setup(void);
-#  ifdef CONFIG_NUCLEO_H743ZI_NXTRACE_HEARTBEAT
-void stm32_nxtrace_heartbeat_start(void);
-#  endif
+void stm32_nxtrace_workers_start(void);
 #endif
 
 /****************************************************************************

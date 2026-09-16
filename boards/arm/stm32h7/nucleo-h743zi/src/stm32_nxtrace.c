@@ -57,6 +57,7 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <sched.h>
+#include <fcntl.h>
 
 #include <nuttx/kthread.h>
 
@@ -201,55 +202,110 @@ static void nxtrace_gpio(void)
   stm32_configgpio(GPIO_TRACED3);
 }
 
-/* Two ping-pong churn threads so the scheduler switches frequently from boot,
- * giving the DWT a steady stream of g_running_tasks writes to capture WITHOUT
- * any manual trigger. Each does a little work then sleeps a short interval, so
- * idle, churn_a and churn_b rotate continuously. Pure demo workload; remove or
- * gate off for production. */
+/* Two demo worker threads with DELIBERATELY DIFFERENT call graphs so each
+ * thread's re-attributed ETM call stack looks distinct in Perfetto (the whole
+ * point: "which thread is doing what"):
+ *   - worker_compute : CPU-bound integer/float math through a small call tree
+ *   - worker_fileio  : open/write/read/close a tmpfs file in a loop
+ * Both periodically sched_yield so the scheduler rotates them (+ idle),
+ * feeding the DWT a steady g_running_tasks stream. Pure demo workload. */
 
-static volatile uint32_t g_churn_sink;
+static volatile uint32_t g_compute_sink;
 
-static int nxtrace_churn(int argc, char *argv[])
+/* Keep the DWT comparator armed: if anything (debug-monitor init, a debugger
+ * connect) cleared it after boot, restore it within one loop iteration so the
+ * switch stream never dries up. Cheap (a few register reads/writes). */
+
+static void nxtrace_dwt_rearm(void)
 {
-  /* Tight ping-pong: a little work then sched_yield() to the equal-priority
-   * peer, so the two churn threads (+ occasionally idle) rotate CONTINUOUSLY
-   * and g_running_tasks is written on every switch -- a steady DWT stream, not
-   * bursts separated by long idle. No usleep: sleeping drops the CPU to idle
-   * for milliseconds and starves the DWT stream. */
+  if (getreg32(DWT_FUNCTION0) != DWT_FUNCTION_DATAVWRITE ||
+      getreg32(DWT_COMP0) != (uint32_t)(uintptr_t)&g_running_tasks[0])
+    {
+      putreg32(0, DWT_FUNCTION0);
+      putreg32((uint32_t)(uintptr_t)&g_running_tasks[0], DWT_COMP0);
+      putreg32(0, DWT_MASK0);
+      putreg32(DWT_FUNCTION_DATAVWRITE, DWT_FUNCTION0);
+    }
+}
+
+/* ---- compute worker: a small call tree of arithmetic ------------------- */
+
+static uint32_t compute_mix(uint32_t x)
+{
+  return (x * 2654435761u) ^ (x >> 15);
+}
+
+static uint32_t compute_step(uint32_t acc, uint32_t i)
+{
+  acc += compute_mix(i);
+  acc = compute_mix(acc + i * 3u);
+  return acc;
+}
+
+static int worker_compute(int argc, char *argv[])
+{
+  uint32_t acc = 0x1234u;
 
   for (; ; )
     {
-      /* Re-arm DWT comparator 0 every loop: if anything (debug monitor init,
-       * a debugger connect, etc.) cleared it after boot, this restores it
-       * within microseconds so the switch stream never dries up. Cheap: three
-       * register writes. Harmless if already armed. */
+      nxtrace_dwt_rearm();
 
-      if (getreg32(DWT_FUNCTION0) != DWT_FUNCTION_DATAVWRITE ||
-          getreg32(DWT_COMP0) != (uint32_t)(uintptr_t)&g_running_tasks[0])
+      for (uint32_t i = 0; i < 400; i++)
         {
-          putreg32(0, DWT_FUNCTION0);
-          putreg32((uint32_t)(uintptr_t)&g_running_tasks[0], DWT_COMP0);
-          putreg32(0, DWT_MASK0);
-          putreg32(DWT_FUNCTION_DATAVWRITE, DWT_FUNCTION0);
+          acc = compute_step(acc, i);
         }
 
-      for (volatile int i = 0; i < 200; i++)
-        {
-          g_churn_sink += i;
-        }
-
-      sched_yield();   /* round-robin to the equal-priority peer -> switch */
+      g_compute_sink = acc;
+      sched_yield();
     }
 
   return 0;
 }
 
-static void nxtrace_spawn_churn(void)
-{
-  /* Equal priority so SCHED_RR / sched_yield round-robins between them. */
+/* ---- fileio worker: write then read back a tmpfs file ------------------ */
 
-  kthread_create("churn_a", 100, 1024, nxtrace_churn, NULL);
-  kthread_create("churn_b", 100, 1024, nxtrace_churn, NULL);
+static int worker_fileio(int argc, char *argv[])
+{
+  static char buf[128];
+  int n;
+
+  for (; ; )
+    {
+      nxtrace_dwt_rearm();
+
+      int fd = open("/tmp/nxio.dat", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      if (fd >= 0)
+        {
+          for (n = 0; n < (int)sizeof(buf); n++)
+            {
+              buf[n] = (char)(n + g_compute_sink);
+            }
+
+          write(fd, buf, sizeof(buf));
+          close(fd);
+        }
+
+      fd = open("/tmp/nxio.dat", O_RDONLY);
+      if (fd >= 0)
+        {
+          read(fd, buf, sizeof(buf));
+          close(fd);
+        }
+
+      sched_yield();
+    }
+
+  return 0;
+}
+
+static void nxtrace_spawn_workers(void)
+{
+  /* Equal priority so SCHED_RR / sched_yield round-robins between them. Two
+   * distinct call graphs -> two visibly different per-thread callstack lanes.
+   * fileio needs a larger stack (VFS + tmpfs paths). */
+
+  kthread_create("compute", 100, 1536, worker_compute, NULL);
+  kthread_create("fileio", 100, 2048, worker_fileio, NULL);
 }
 
 /****************************************************************************
@@ -360,9 +416,20 @@ void stm32_nxtrace_setup(void)
          (void *)&g_running_tasks[0],
          (unsigned long)getreg32(DWT_FUNCTION0));
 
-  /* Kick off the churn workload so switches happen continuously from boot. */
+}
 
-  nxtrace_spawn_churn();
+/****************************************************************************
+ * Name: stm32_nxtrace_workers_start
+ *
+ * Description:
+ *   Spawn the two demo worker threads (compute + tmpfs file I/O). Call AFTER
+ *   the tmpfs mount so the fileio worker has /tmp available.
+ *
+ ****************************************************************************/
+
+void stm32_nxtrace_workers_start(void)
+{
+  nxtrace_spawn_workers();
 }
 
 #endif /* CONFIG_NUCLEO_H743ZI_NXTRACE */
