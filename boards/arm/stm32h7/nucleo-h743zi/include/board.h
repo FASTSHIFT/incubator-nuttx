@@ -96,8 +96,14 @@
  *   PLL1P = PLL1_VCO/4  = 600 MHz / 4   = 150 MHz  (sysclk)
  *   PLL1Q = PLL1_VCO/4  = 600 MHz / 4   = 150 MHz
  *   PLL1R = PLL1_VCO/4  = 600 MHz / 4   = 150 MHz  (TRACECLKIN)
- *   (150 MHz is the verified clean 2-bit ceiling at default FPGA tap; 200 MHz
- *    closes the IDDR eye -> deframe fails. See doc SS11.10.)
+ *
+ * Back at sysclk 150 MHz (doc SS11.11): the CPU@200M experiment showed the ETM
+ * byte-rate outran the 2-bit port and overflowed at O0; O2 fixed it at 4-bit,
+ * but the default working point stays 150 MHz sysclk + O0 (widest headroom,
+ * simplest call stacks). PLL1P and PLL1R are independent dividers off the same
+ * VCO; if you want to re-run CPU@200M use P=3 (DIVP1 must be ODD, RM0433) and
+ * host --sysclk-hz 200000000, keeping R=4 for the verified-clean 150M TRACECLK.
+ * 150M TRACECLK 2-bit is the clean FPGA-sampling ceiling.
  *
  * TRACECLK sweep (2-bit port headroom experiment, doc SS11.10): PLL1R only
  * feeds TRACECLKIN, independent of PLL1P/sysclk, so changing it does NOT touch
