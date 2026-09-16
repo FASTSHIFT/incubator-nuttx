@@ -145,6 +145,7 @@
 #define ETM_TRCSTALLCTLR (ETM_BASE + 0x02cu)
 #define ETM_TRCTSCTLR    (ETM_BASE + 0x030u)
 #define ETM_TRCSYNCPR    (ETM_BASE + 0x034u)
+#define ETM_TRCCCCTLR    (ETM_BASE + 0x038u)
 #define ETM_TRCTRACEIDR  (ETM_BASE + 0x040u)
 #define ETM_TRCVICTLR    (ETM_BASE + 0x080u)
 #define ETM_TRCPDCR      (ETM_BASE + 0x310u)
@@ -152,11 +153,21 @@
 #define ETM_TRCPRGCTLR_EN   (1u << 0)
 #define ETM_TRCSTATR_IDLE   (1u << 0)
 #define ETM_TRCCONFIGR_BB   (1u << 3)
+#define ETM_TRCCONFIGR_CCI  (1u << 4)   /* cycle counting instruction */
+#define ETM_TRCCONFIGR_TS   (1u << 11)  /* global timestamping */
+#define ETM_TRCCCCTLR_THRESHOLD 0x00000010u   /* 16 cycles (>= TRCIDR3.CCITMIN) */
 #define ETM_TRCSTALLCTLR_ISTALL (1u << 8)
 #define ETM_TRCVICTLR_TRACE_ALL 0x00000201u
 #define ETM_TRCTRACEIDR_ID2     0x00000002u
 #define ETM_TRCSYNCPR_4K        0x0000000cu
 #define ETM_TRCPDCR_PU          (1u << 3)
+
+/* --- CoreSight timestamp generator (TSGEN, APB-D alias 0x5C005000) -------- */
+/* The SoC-wide counter the ETM samples into TIMESTAMP packets. Resets DISABLED
+ * (CNTCR=0), so every ETM timestamp reads 0 until CNTCR.EN is set. */
+
+#define TSGEN_CNTCR      0x5c005000u
+#define TSGEN_CNTCR_EN     (1u << 0)
 
 /* --- DWT + ITM (core PPB) ------------------------------------------------ */
 
@@ -266,6 +277,11 @@ void stm32_nxtrace_setup(void)
   modifyreg32(DBGMCU_CR, 0, DBGMCU_CR_TRACE_ALL);
   putreg32(DEMCR_TRCENA, DEMCR);
 
+  /* Enable the SoC timestamp generator so ETM TIMESTAMP packets carry a real
+   * count (it resets disabled -> every timestamp would otherwise read 0). */
+
+  modifyreg32(TSGEN_CNTCR, 0, TSGEN_CNTCR_EN);
+
   /* 2) TPIU: 4-bit parallel, continuous formatter. */
 
   putreg32(CS_LAR_UNLOCK, TPIU_LAR);
@@ -302,8 +318,19 @@ void stm32_nxtrace_setup(void)
         }
     }
 
-  putreg32(ETM_TRCCONFIGR_BB, ETM_TRCCONFIGR);
+  /* Global timestamping (TS) + cycle counting (CCI), NO branch broadcast (BB).
+   * BB emits an address on every taken branch -> high byte-rate that overruns
+   * the parallel port when combined with TS/CC; without BB only indirect
+   * branches emit addresses and the decoder walks the ELF for direct branches,
+   * so the stream fits. TS gives sparse execution-time anchors from the TSGEN;
+   * CCI emits exact CPU-cycle counts so the host interpolates between anchors at
+   * cycle resolution -- the real execution-time base (NOT the FPGA ETF-egress
+   * time, which lags through the FIFO). Keep stall as ISTALL only (LEVEL=0): a
+   * nonzero stall LEVEL suppresses in-stream timestamps (DDI0494D §3.4.7). */
+
+  putreg32(ETM_TRCCONFIGR_TS | ETM_TRCCONFIGR_CCI, ETM_TRCCONFIGR);
   putreg32(ETM_TRCTRACEIDR_ID2, ETM_TRCTRACEIDR);
+  putreg32(ETM_TRCCCCTLR_THRESHOLD, ETM_TRCCCCTLR);
   putreg32(ETM_TRCSTALLCTLR_ISTALL, ETM_TRCSTALLCTLR);
   putreg32(ETM_TRCVICTLR_TRACE_ALL, ETM_TRCVICTLR);
   putreg32(ETM_TRCSYNCPR_4K, ETM_TRCSYNCPR);
