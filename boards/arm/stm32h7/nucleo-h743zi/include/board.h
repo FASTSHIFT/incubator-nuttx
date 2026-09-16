@@ -95,7 +95,15 @@
  *
  *   PLL1P = PLL1_VCO/4  = 600 MHz / 4   = 150 MHz  (sysclk)
  *   PLL1Q = PLL1_VCO/4  = 600 MHz / 4   = 150 MHz
- *   PLL1R = PLL1_VCO/6  = 600 MHz / 6   = 100 MHz  (TRACECLKIN)
+ *   PLL1R = PLL1_VCO/4  = 600 MHz / 4   = 150 MHz  (TRACECLKIN)
+ *   (150 MHz is the verified clean 2-bit ceiling at default FPGA tap; 200 MHz
+ *    closes the IDDR eye -> deframe fails. See doc SS11.10.)
+ *
+ * TRACECLK sweep (2-bit port headroom experiment, doc SS11.10): PLL1R only
+ * feeds TRACECLKIN, independent of PLL1P/sysclk, so changing it does NOT touch
+ * the CPU clock. R=6->100M, R=5->120M, R=4->150M, R=3->200M TRACECLKIN
+ * (TRACECK pin = half via DDR). Host decode cycle-count clock stays
+ * --sysclk-hz 150000000 (sysclk unchanged).
  *
  * Lowered from 400 MHz sysclk to keep the ETM instruction-trace byte-rate
  * under the 50 MB/s parallel-port ceiling (at 400 MHz the port saturated and
@@ -114,12 +122,12 @@
 #define STM32_PLLCFG_PLL1N       RCC_PLL1DIVR_N1(120)
 #define STM32_PLLCFG_PLL1P       RCC_PLL1DIVR_P1(4)
 #define STM32_PLLCFG_PLL1Q       RCC_PLL1DIVR_Q1(4)
-#define STM32_PLLCFG_PLL1R       RCC_PLL1DIVR_R1(6)
+#define STM32_PLLCFG_PLL1R       RCC_PLL1DIVR_R1(4)
 
 #define STM32_VCO1_FREQUENCY     ((STM32_HSE_FREQUENCY / 5) * 120)
 #define STM32_PLL1P_FREQUENCY    (STM32_VCO1_FREQUENCY / 4)
 #define STM32_PLL1Q_FREQUENCY    (STM32_VCO1_FREQUENCY / 4)
-#define STM32_PLL1R_FREQUENCY    (STM32_VCO1_FREQUENCY / 6)
+#define STM32_PLL1R_FREQUENCY    (STM32_VCO1_FREQUENCY / 4)
 
 /* PLL2 */
 
