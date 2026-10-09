@@ -128,6 +128,41 @@ config ARMV7M_ITMSYSLOG_SWODIV
 
 endif # ARMV7M_ITMSYSLOG
 
+config ARMV7M_NOTE_ITM
+	bool "Sched note driver over ITM stimulus port"
+	default n
+	depends on DRIVERS_NOTE
+	---help---
+		Write scheduler instrumentation notes to an ITM stimulus port.  The
+		packets leave the chip through the trace sink the debugger set up
+		(parallel TPIU or SWO), on the same time base as ETM/DWT trace.  The
+		ITM must be enabled by the debugger; with no debugger the driver
+		emits nothing.  The host reassembles the port's payload bytes into
+		the note stream.
+
+if ARMV7M_NOTE_ITM
+
+config ARMV7M_NOTE_ITM_PORT
+	int "ITM stimulus port for notes"
+	default 1
+	range 0 31
+	---help---
+		Stimulus port the notes are written to.  Do not share it with
+		ARMV7M_ITMSYSLOG_PORT.
+
+config ARMV7M_NOTE_ITM_TIMEOUT
+	int "Max FIFOREADY polls per word before dropping the rest of a note"
+	default 4096
+	range 1 1000000
+	---help---
+		If the trace sink is backed up (ETF full) the ITM FIFO stays full.
+		The driver spins at most this many reads per word with interrupts
+		off, then abandons the rest of that note (the host re-synchronises
+		on the next note).  Larger values lose fewer notes but stall the CPU
+		longer when the sink is stuck.
+
+endif # ARMV7M_NOTE_ITM
+
 config ARMV7M_SYSTICK
 	bool "SysTick timer driver"
 	depends on TIMER
