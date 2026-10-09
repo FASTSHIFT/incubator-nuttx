@@ -54,4 +54,14 @@ config NUCLEO_H743ZI_NXTRACE_HEARTBEAT
 		the DWT comparator. The real demo workload (hellotrace churn workers)
 		rides on top of this.
 
+config NUCLEO_H743ZI_NXTRACE_WORKER_PERIOD_US
+	int "nxtrace demo worker pacing (us, 0 = yield only)"
+	default 0
+	depends on NUCLEO_H743ZI_NXTRACE
+	---help---
+		Sleep this many microseconds after each sched_yield() in the demo
+		workers. 0 keeps the original busy ping-pong (thousands of thread
+		switches per second). Raise it (e.g. 20000) when the scheduler notes
+		are streamed over a slow link such as SEGGER RTT through a full-speed
+		CMSIS-DAP probe, which only carries ~20 KB/s.
 endif # ARCH_BOARD_NUCLEO_H743ZI

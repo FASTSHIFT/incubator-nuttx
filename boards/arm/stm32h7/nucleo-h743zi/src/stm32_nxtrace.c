@@ -58,18 +58,43 @@
 
 static volatile uint32_t g_compute_sink;
 
+/* Worker pacing. With CONFIG_NUCLEO_H743ZI_NXTRACE_WORKER_PERIOD_US == 0 the
+ * workers just sched_yield() back and forth (thousands of switches/s, the
+ * stress case for ETM/DWT). A non-zero period sleeps that long after each
+ * yield so the switch rate -- and with it the volume of scheduler notes -- is
+ * low enough for a slow note transport such as SEGGER RTT over a full-speed
+ * CMSIS-DAP probe (~20 KB/s).
+ */
+
+static void worker_pace(void)
+{
+  sched_yield();
+#if CONFIG_NUCLEO_H743ZI_NXTRACE_WORKER_PERIOD_US > 0
+  usleep(CONFIG_NUCLEO_H743ZI_NXTRACE_WORKER_PERIOD_US);
+#endif
+}
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
 
-/* compute worker: a small arithmetic call tree (compute_step -> compute_mix). */
+/* compute worker: a small arithmetic call tree (compute_step -> compute_mix).
+ *
+ * noinline: at -O2 the compiler folds the whole tree into a nine-instruction
+ * loop inside worker_compute, so the ETM trace shows no function calls for this
+ * thread. Keeping the calls real is what makes the call tree visible. The
+ * second compute_mix() call in compute_step would otherwise become a tail call
+ * (b.w), which hides compute_step's frame from the return-address call-stack
+ * reconstruction, so sibling-call optimisation is off for it.
+ */
 
-static uint32_t compute_mix(uint32_t x)
+static uint32_t __attribute__((noinline)) compute_mix(uint32_t x)
 {
   return (x * 2654435761u) ^ (x >> 15);
 }
 
-static uint32_t compute_step(uint32_t acc, uint32_t i)
+static uint32_t __attribute__((noinline, optimize("no-optimize-sibling-calls")))
+compute_step(uint32_t acc, uint32_t i)
 {
   acc += compute_mix(i);
   acc = compute_mix(acc + i * 3u);
@@ -88,7 +113,7 @@ static int worker_compute(int argc, char *argv[])
         }
 
       g_compute_sink = acc;
-      sched_yield();
+      worker_pace();
     }
 
   return 0;
@@ -122,7 +147,7 @@ static int worker_fileio(int argc, char *argv[])
           close(fd);
         }
 
-      sched_yield();
+      worker_pace();
     }
 
   return 0;
